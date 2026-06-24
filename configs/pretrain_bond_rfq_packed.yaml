@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bond-RFQ FM — Decoder-Only Pretraining (PACKED corpus / GPU path)
+#
+# Adapted from NVIDIA's pretrain_financial_decoder.yaml. Key changes vs the
+# transaction FM:
+#   * dataset._target_ -> src/rfq_clm_data.py:build_rfq_clm_dataset
+#     (corpus lines are pre-tokenized RFQ field tokens; encoding is a vocab
+#      lookup, no GPU tokenizer at load time)
+#   * vocab_size 6251 -> 75  (the RFQ field vocab is tiny and bounded)
+#   * model right-sized DOWN. The RFQ generative process has a small, known
+#     latent dimension and a deliberate intent-noise ceiling, so a 29M model
+#     would memorise. This config is the ~8M "sweet spot"; the size sweep
+#     (scripts/sweep_model_size) overrides hidden_size/num_hidden_layers.
+#   * trained PAST the TFM 30-step demo: this is a real (if small) run.
+#
+# Launch (single GPU dev):
+#   python scripts/train_decoder_model.py -c configs/pretrain_bond_rfq_packed.yaml \
+#       --dataset.tokens_path data/rfq_corpus/cellA_train_tokens.npy \
+#       --dataset.offsets_path data/rfq_corpus/cellA_train_offsets.npy \
+#       --validation_dataset.tokens_path data/rfq_corpus/cellA_val_tokens.npy \
+#       --validation_dataset.offsets_path data/rfq_corpus/cellA_val_offsets.npy
+#
+# Single H200: a 4-8M model fits trivially; no multi-GPU / FSDP needed.
+# Launch with plain `python` (or torchrun --nproc-per-node=1).
+
+# -- Model ----------------------------------------------------------------
+# ~8M param Llama decoder. Same architectural family as the reference
+# (RoPE / GQA / SwiGLU / RMSNorm / no dropout) but scaled to the RFQ regime.
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_config
+  config:
+    _target_: transformers.LlamaConfig
+    vocab_size: 75                # RFQ field vocab (RFQTokenizer.vocab_size)
+    hidden_size: 256              # sweep: {192, 256, 384}
+    num_hidden_layers: 6          # sweep: {4, 6, 8}
+    num_attention_heads: 8
+    num_key_value_heads: 2        # GQA 4:1
+    intermediate_size: 704        # ~2.75x hidden, SwiGLU
+    max_position_embeddings: 4096
+    rope_theta: 100000.0          # context ~4096; lower base than TFM's 500k
+    hidden_act: silu
+    rms_norm_eps: 1.0e-5
+    attention_dropout: 0.0
+    tie_word_embeddings: true     # tiny vocab -> tie embeddings to save params
+    bos_token_id: 1
+    eos_token_id: 2
+    pad_token_id: 0
+
+# -- Training Dataset -----------------------------------------------------
+dataset:
+  _target_: src/rfq_clm_data.py:build_rfq_packed_clm_dataset
+  tokens_path: null               # set on CLI: data/rfq_corpus/cellA_train_tokens.npy
+  offsets_path: null              # set on CLI: data/rfq_corpus/cellA_train_offsets.npy
+  pad_token_id: 0
+  seq_length: 4096
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+
+# -- Validation Dataset ----------------------------------------------------
+validation_dataset:
+  _target_: src/rfq_clm_data.py:build_rfq_packed_clm_dataset
+  tokens_path: null               # set on CLI: data/rfq_corpus/cellA_val_tokens.npy
+  offsets_path: null              # set on CLI: data/rfq_corpus/cellA_val_offsets.npy
+  pad_token_id: 0
+  seq_length: 4096
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+
+# -- Training Schedule -----------------------------------------------------
+# Real run (not the 30-step demo). Tune max_steps against the val-loss curve;
+# with ~8M params and ~227M tokens/yr this is comfortably Chinchilla-fed and
+# can run multiple epochs. Numbers below are a full-scale starting point.
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 16
+  ckpt_every_steps: 500
+  val_every_steps: 250
+  num_epochs: 10
+  max_steps: 8000
+
+# -- Distribution ----------------------------------------------------------
+# Single H200: launch with one process (plain `python`). With world_size=1 the
+# FSDP2Manager below degenerates to plain single-device training (no sharding,
+# negligible overhead) — it is NeMo's standard path and needs no change.
+dist_env:
+  backend: nccl
+  timeout_minutes: 10
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  dp_size: none
+  dp_replicate_size: 1
+  tp_size: 1
+  cp_size: 1
+  sequence_parallel: false
+
+# -- Loss ------------------------------------------------------------------
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+# -- Optimizer -------------------------------------------------------------
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  lr: 0.0003
+  weight_decay: 0.05
+
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 200
+  min_lr: 0.00001
+
+# -- RNG -------------------------------------------------------------------
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+# -- Checkpointing ---------------------------------------------------------
+checkpoint:
+  enabled: true
+  checkpoint_dir: models/bond-rfq-fm/checkpoints/
+  model_save_format: safetensors
+  save_consolidated: true
+  model_repo_id: bond-rfq-decoder
